@@ -103,33 +103,39 @@ func runScript(folder, filename string, ctx context.Context) {
 
 
 //Worker process task from the queue
-func Worker(id int, taskQueue *TaskQueue) {
+func Worker(id int, taskQueue *TaskQueue, stopChan chan struct{}) {
         for {
-		cmd, ok := taskQueue.GetCommand()
+		select {
+		case <-stopChan:
+			logMessage(fmt.Sprintf("Worker %d stopping...\n", id))
+			return
+		default:
+			cmd, ok := taskQueue.GetCommand()
 		
-		if !ok {
-			time.Sleep(100 * time.Millisecond) //No tasks available
-                        continue
-                }
+			if !ok {
+				time.Sleep(100 * time.Millisecond) //No tasks available
+                        	continue
+                	}
 			
-		if cmd.Action == "start" {
-			key := fmt.Sprintf("%s:%s", cmd.Folder, cmd.Filename)
+			if cmd.Action == "start" {
+				key := fmt.Sprintf("%s:%s", cmd.Folder, cmd.Filename)
 
-			if taskQueue.IsActive(cmd.Folder, cmd.Filename) {
-				logMessage(fmt.Sprintf("Worker %d: task %s %s is already running. Skipping...\n", id, cmd.Folder, cmd.Filename))
+				if taskQueue.IsActive(cmd.Folder, cmd.Filename) {
+					logMessage(fmt.Sprintf("Worker %d: task %s %s is already running. Skipping...\n", id, cmd.Folder, cmd.Filename))
+				}
+
+				ctx, cancel := context.WithCancel(context.Background())
+				taskQueue.SetActive(cmd.Folder, cmd.Filename, cancel)
+			
+				go func(folder, filename string) {
+					defer func() {
+						taskQueue.mu.Lock()
+						delete(taskQueue.active, key)
+						taskQueue.mu.Unlock()
+					}()
+					runScript(folder, filename, ctx)
+				}(cmd.Folder, cmd.Filename)
 			}
-
-			ctx, cancel := context.WithCancel(context.Background())
-			taskQueue.SetActive(cmd.Folder, cmd.Filename, cancel)
-			
-			go func(folder, filename string) {
-				defer func() {
-					taskQueue.mu.Lock()
-					delete(taskQueue.active, key)
-					taskQueue.mu.Unlock()
-				}()
-				runScript(folder, filename, ctx)
-			}(cmd.Folder, cmd.Filename)
 		}
 	}
 }
@@ -226,6 +232,14 @@ func logMessage(message string) {
 func setupLogFile() {
 	logFileLock.Lock()
 	defer logFileLock.Unlock()
+	
+	logsDir := "./__LOGS"
+	if _, err := os.Stat(logsDir); os.IsNotExist(err) {
+		if err := os.Mkdir(logsDir, os.ModePerm); err != nil {
+			fmt.Printf("Failed to create logs directory: %v\n", err)
+			os.Exit(1)
+		}
+	}
 
 	//Close existing log file
 	if logFile != nil {
@@ -234,8 +248,8 @@ func setupLogFile() {
 
 	//Create a new log file with the current hour
 	now := time.Now()
-	logFileName := fmt.Sprintf("./__LOGS/process_log_%s.txt", now.Format("2006-01-02_15"))
-	logFilePath := filepath.Join(".", logFileName)
+	logFileName := fmt.Sprintf("process_log_%s.txt", now.Format("2006-01-02_15"))
+	logFilePath := filepath.Join(logsDir, logFileName)
 
 	var err error
 	logFile, err = os.Create(logFilePath)
@@ -245,12 +259,20 @@ func setupLogFile() {
 		os.Exit(1)
 	}
 
-	logMessage("Start new log file")
+	fmt.Println("Start new log file")
 }
 
 //Main Function
 func main() {
 	setupLogFile()
+
+	defer func() {
+		logFileLock.Lock()
+		if logFile != nil {
+			logFile.Close()
+		}
+		logFileLock.Unlock()
+	}()
 
 	ticker := time.NewTicker(1 * time.Hour)
 	go func() {
@@ -270,13 +292,21 @@ func main() {
 
 	taskQueue := NewTaskQueue()
 	stopChan := make(chan struct{})
+	var wg sync.WaitGroup
 
-	//Start folder watcher
-	go WatchFolder(folderToWatch, taskQueue, stopChan)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		WatchFolder(folderToWatch, taskQueue, stopChan)
+	}()
 
 	//Start workers
 	for i := 0; i < numWorkers; i++ {
-		go Worker(i, taskQueue)
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			Worker(workerID, taskQueue, stopChan)
+		}(i)
 	}
 
 	//Wait for user interrupt to stop
@@ -291,5 +321,5 @@ func main() {
 		os.Exit(0)
 	}()
 
-	select {}
+	select{}
 }
