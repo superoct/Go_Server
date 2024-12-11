@@ -1,13 +1,14 @@
 package main
 
 import (
-	"context"
 	"bufio"
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -48,8 +49,12 @@ func (q *TaskQueue) AddCommand(cmd Command) {
 			delete(q.active, key) //Remove active task if "stop" command
 		}
 	} else if cmd.Action == "start" {
-		logMessage(fmt.Sprintf("Start command received: %s %s\n", cmd.Folder, cmd.Filename))
-		q.commands = append(q.commands, cmd)
+		if _, exists := q.active[key]; !exists {
+			logMessage(fmt.Sprintf("Start command received: %s %s\n", cmd.Folder, cmd.Filename))
+			q.commands = append(q.commands, cmd)
+		} else {
+			logMessage(fmt.Sprintf("Task %s %s is already running. Skipping addition. \n", cmd.Folder, cmd.Filename))
+		}
 	}
 }
 
@@ -87,6 +92,84 @@ func (q *TaskQueue) IsActive(folder, filename string) bool {
 	return active
 }
 
+//TokenBucket for resource tracking
+type TokenBucket struct {
+	capacity int
+	tokens   int
+	mu       sync.Mutex
+}
+
+func NewTokenBucket(capacity int) *TokenBucket {
+	return &TokenBucket{capacity: capacity, tokens: capacity}
+}
+
+func (tb *TokenBucket) Acquire() bool {
+	tb.mu.Lock()
+	defer tb.mu.Unlock()
+
+	if tb.tokens > 0 {
+		tb.tokens--
+		return true
+	}
+
+	return false
+}
+
+func (tb *TokenBucket) Release() {
+	tb.mu.Lock()
+	defer tb.mu.Unlock()
+	if tb.tokens < tb.capacity {
+		tb.tokens++
+	}
+}
+
+//Woker processes tasks from the queue
+func Worker(id int, taskQueue *TaskQueue, tokenBucket *TokenBucket, stopChan chan struct{}) {
+	for {
+		select {
+		case <-stopChan:
+			logMessage(fmt.Sprintf("Worker %d stopping...\n", id))
+			return
+		default:
+			cmd, ok := taskQueue.GetCommand()
+
+			if !ok {
+				time.Sleep(100 * time.Millisecond)
+				continue
+			}
+
+			key := fmt.Sprintf("%s:%s", cmd.Folder, cmd.Filename)
+
+			if cmd.Action == "start" {
+				if taskQueue.IsActive(cmd.Folder, cmd.Filename) {
+					logMessage(fmt.Sprintf("Worker %d: task %s %s is already running. Skipping...\n", id, cmd.Folder, cmd.Filename))
+					continue
+				}
+
+				if !tokenBucket.Acquire() {
+					//logMessage(fmt.Sprintf("Worker %d: insufficent resources for task %s %s. Retrying...\n", id, cmd.Folder, cmd.Filename))
+					taskQueue.AddCommand(cmd) //Requeue the task
+					time.Sleep(100 * time.Millisecond)
+					continue
+				}
+
+				ctx, cancel := context.WithCancel(context.Background())
+				taskQueue.SetActive(cmd.Folder, cmd.Filename, cancel)
+
+				go func(folder, filename string) {
+					defer func() {
+						taskQueue.mu.Lock()
+						delete(taskQueue.active, key)
+						taskQueue.mu.Unlock()
+						tokenBucket.Release()
+					}()
+					runScript(folder, filename, ctx)
+				}(cmd.Folder, cmd.Filename)
+			}
+		}
+	}
+}
+
 //RunScript executes the command
 func runScript(folder, filename string, ctx context.Context) {
 	logMessage(fmt.Sprintf("Running script for %s %s\n", folder, filename))
@@ -101,45 +184,6 @@ func runScript(folder, filename string, ctx context.Context) {
 	logMessage(fmt.Sprintf("Script output for %s %s: %s\n", folder, filename, string(output)))
 }
 
-
-//Worker process task from the queue
-func Worker(id int, taskQueue *TaskQueue, stopChan chan struct{}) {
-        for {
-		select {
-		case <-stopChan:
-			logMessage(fmt.Sprintf("Worker %d stopping...\n", id))
-			return
-		default:
-			cmd, ok := taskQueue.GetCommand()
-		
-			if !ok {
-				time.Sleep(100 * time.Millisecond) //No tasks available
-                        	continue
-                	}
-			
-			if cmd.Action == "start" {
-				key := fmt.Sprintf("%s:%s", cmd.Folder, cmd.Filename)
-
-				if taskQueue.IsActive(cmd.Folder, cmd.Filename) {
-					logMessage(fmt.Sprintf("Worker %d: task %s %s is already running. Skipping...\n", id, cmd.Folder, cmd.Filename))
-				}
-
-				ctx, cancel := context.WithCancel(context.Background())
-				taskQueue.SetActive(cmd.Folder, cmd.Filename, cancel)
-			
-				go func(folder, filename string) {
-					defer func() {
-						taskQueue.mu.Lock()
-						delete(taskQueue.active, key)
-						taskQueue.mu.Unlock()
-					}()
-					runScript(folder, filename, ctx)
-				}(cmd.Folder, cmd.Filename)
-			}
-		}
-	}
-}
-
 //WatchFolder watches a folder for new command files
 func WatchFolder(folder string, taskQueue *TaskQueue, stopChan chan struct{}) {
 	for {
@@ -149,6 +193,7 @@ func WatchFolder(folder string, taskQueue *TaskQueue, stopChan chan struct{}) {
 			return
 		default:
 			files, err := os.ReadDir(folder)
+
 			if err != nil {
 				logMessage(fmt.Sprintf("Error reading folder: %v\n", err))
 				time.Sleep(1 * time.Second)
@@ -282,7 +327,8 @@ func main() {
 	}()
 
 	folderToWatch := "./commands"
-	numWorkers := 4
+	numWorkers := runtime.NumCPU()
+	tokenBucket := NewTokenBucket(numWorkers*2) //Limit concurrency to 2 tasks
 
 	//Ensure the folder exists
 	if _, err := os.Stat(folderToWatch); os.IsNotExist(err) {
@@ -305,7 +351,7 @@ func main() {
 		wg.Add(1)
 		go func(workerID int) {
 			defer wg.Done()
-			Worker(workerID, taskQueue, stopChan)
+			Worker(workerID, taskQueue, tokenBucket, stopChan)
 		}(i)
 	}
 
@@ -317,6 +363,7 @@ func main() {
 		signal.Notify(interruptChan, os.Interrupt)
 		<-interruptChan
 		close(stopChan)
+		wg.Wait()
 		fmt.Println("All workers stopped. Exiting.")
 		os.Exit(0)
 	}()
